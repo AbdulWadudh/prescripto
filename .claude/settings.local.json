@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import llama_cpp; print\\(llama_cpp.__version__\\)\")",
+      "Bash(python -c \"import llama_cpp.llama_chat_format as f; print\\([x for x in dir\\(f\\) if 'Chat' in x or 'VL' in x or 'Vision' in x or 'qwen' in x.lower\\(\\) or 'vision' in x.lower\\(\\)]\\)\")"
+    ]
+  }
+}
