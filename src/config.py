@@ -7,7 +7,7 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 DB_PATH    = os.path.join(BASE_DIR, "prescriptions.db")
 PROMPTS_DIR = os.path.join(BASE_DIR, "prompts")
 
-TEXT_MODEL_PATH    = os.path.join(MODELS_DIR, "gemma-4-E4B-it-Q4_K_M.gguf")
+TEXT_MODEL_PATH    = os.path.join(MODELS_DIR, "google_gemma-4-E4B-it-Q4_K_M.gguf")
 VISION_MODEL_PATH  = os.path.join(MODELS_DIR, "Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf")
 VISION_MMPROJ_PATH = os.path.join(MODELS_DIR, "mmproj-Qwen_Qwen2.5-VL-7B-Instruct-f16.gguf")
 

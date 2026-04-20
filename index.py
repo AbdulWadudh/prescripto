@@ -16,4 +16,4 @@ Layout:
 from src.ui import prescripto, SIDEBAR_CSS, SETUP_JS
 
 if __name__ == "__main__":
-    prescripto.launch(css=SIDEBAR_CSS, js=SETUP_JS)
+    prescripto.launch(css=SIDEBAR_CSS, js=SETUP_JS, share=False)

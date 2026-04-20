@@ -1,0 +1,17 @@
+[project]
+name = "prescripto"
+version = "0.1.0"
+description = "Fully offline Indian Medical Prescription Analyzer"
+requires-python = ">=3.10"
+dependencies = [
+    "gradio>=5.0.0",
+    "pymupdf>=1.24.0",
+    "pillow>=10.0.0",
+    "json-repair>=0.30.0",
+]
+
+# llama-cpp-python is listed separately because GPU builds require
+# CMAKE_ARGS to be set before installation — see README for instructions.
+
+[project.scripts]
+prescripto = "index:main"

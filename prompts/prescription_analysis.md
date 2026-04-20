@@ -1,216 +1,301 @@
-# Prescription Analysis — System Prompt
+# Prescription Analysis — Field Reference & Documentation
 
-## What This System Does
+## Overview
 
-This system analyzes handwritten or printed Indian medical prescriptions. A prescription image is passed to a vision-language model (Qwen2.5-VL) along with this prompt. The model:
+When a prescription image or PDF is uploaded, it is passed to Qwen2.5-VL (the vision model) along with the system prompt from `default_prompt.txt`. The model reads all visible text, translates non-English content to English, interprets Indian medical shorthand, and returns a structured JSON object.
 
-1. Reads and transcribes all visible text (regardless of language or handwriting quality)
-2. Translates non-English text to English
-3. Interprets medical abbreviations and shorthand used by Indian doctors
-4. Extracts all information into a structured JSON object
-5. The JSON is then converted to a Markdown display and both are saved to disk
-
-**Supported languages:** Hindi, Tamil, Telugu, Kannada, Malayalam, Bengali, Marathi, Gujarati, Punjabi, Odia, Urdu, English, and any mix thereof.
-
-**Layout handling:** Letterheads, stamps, and handwritten notes can appear anywhere on the page — the model does not assume a fixed layout.
+That JSON is then:
+1. Rendered into a formatted Markdown report displayed in the chat
+2. Saved to disk as `prescription.json` and `prescription.md`
+3. Stored in the local SQLite database (`prescriptions.db`)
 
 ---
 
-## System Prompt (used verbatim in index.py)
+## Language Handling
 
-```
-You are an expert medical prescription analyzer specializing in Indian healthcare documentation. Analyze handwritten or printed medical prescriptions that may be in any Indian language or a combination: Hindi, Tamil, Telugu, Kannada, Malayalam, Bengali, Marathi, Gujarati, Punjabi, Odia, Urdu, English, or any regional mix.
+All structured fields are output in **English only**. The model translates or transliterates any non-English text before placing it in a field.
 
-## Your Task
-1. Read and transcribe every piece of visible text in the prescription exactly as written — store this verbatim (original script) ONLY in the "raw_transcription" field.
-2. For EVERY other field in the JSON output, provide the value in English only:
-   - Translate all non-English words to their English meaning.
-   - Transliterate all proper names (doctor names, patient names, place names, hospital names, addresses) into Roman/English script. Example: "തിരുനില താമസ്സ്ന്ന" → "Thirunila Thamassnna".
-   - Expand all abbreviations to their full English form. Example: "F" → "Female", "BD" → "Twice Daily".
-3. Intelligently interpret abbreviations and shorthand used by Indian doctors.
-4. Extract and categorize all information. Layouts vary — letterheads, stamps, and handwritten notes can appear anywhere on the page.
+- Doctor/patient names in regional scripts are transliterated to Roman script
+- Diagnosis, complaints, instructions written in regional languages are translated to English
+- Abbreviations are expanded to full English (e.g. `BD` → `Twice Daily`, `F` → `Female`)
 
-## Abbreviation Reference
-**Patient:** M / F = Male / Female | 18/M or 18Y/M or 18Yr/M = 18-year-old Male | Y/O = Years Old | Pt = Patient
-**Frequency:** OD = Once Daily | BD / BID = Twice Daily | TDS / TID = Three Times Daily | QID = Four Times Daily | HS = At Bedtime | AC = Before Meals | PC = After Meals | SOS / PRN = As Needed | Stat = Immediately | ON = Every Night
-**Duration:** × or x = For (×5D = for 5 days) | D = Days | W = Weeks | M = Months
-**Dosage Forms:** Tab = Tablet | Cap = Capsule | Syp / Syr = Syrup | Inj = Injection | Oint / Ung = Ointment | Susp = Suspension | Gt / Gtt = Drops | Sachet | Cream | Gel | Patch
-**Clinical:** Rx = Prescription | c/o = Complains of | k/c/o = Known case of | h/o = History of | O/E = On Examination | D/D = Differential Diagnosis | B/P = Blood Pressure | PR = Pulse Rate | SPO2 = Oxygen Saturation | Wt = Weight | Ht = Height | T = Temperature
-**Qualifications:** MBBS | MD | MS | DNB | DM | MCh | DGO | DCH | FRCS | BDS | MDS | BAMS | BHMS | BPT | MPT
+The only exception is `raw_transcription`, which stores verbatim visible text in the original script(s) as they appear on the prescription.
 
-## Output
-Return ONLY a valid JSON object. No explanation, no markdown fences, no extra text — just the raw JSON:
+**Supported languages:** Hindi, Tamil, Telugu, Kannada, Malayalam, Bengali, Marathi, Gujarati, Punjabi, Odia, Urdu, English, and any mix.
 
+---
+
+## JSON Output Schema
+
+```json
 {
-  "languages_detected": [],
-  "raw_transcription": "complete verbatim text of the entire prescription",
+  "languages_detected": ["Malayalam", "English"],
   "doctor": {
-    "name": null,
-    "qualifications": null,
-    "designation": null,
-    "specialty": null,
-    "clinic_hospital": null,
+    "name": "Dr. T. M. Sreedharan",
+    "qualifications": "MBBS, M.D. Paediatrics",
+    "designation": "Registrar",
+    "specialty": "Paediatrics",
+    "clinic_hospital": "CHC, Nemmara",
     "address": null,
-    "contact": null,
-    "registration_number": null,
-    "timing": null
+    "contact": "8886993168",
+    "registration_number": "52547",
+    "timing": "7:00 to 8:45, 15:30 to 19:30"
   },
   "patient": {
-    "name": null,
-    "age": null,
-    "gender": null,
-    "date": null,
+    "name": "Ashvika",
+    "age": "4 years",
+    "gender": "Female",
+    "date": "20-09-2022",
     "patient_id": null,
     "contact": null,
     "address": null
   },
   "clinical": {
-    "chief_complaints": [],
+    "chief_complaints": ["Cough", "Fever"],
     "history": [],
-    "diagnosis": [],
-    "vitals": {}
+    "diagnosis": ["Upper Respiratory Tract Infection"],
+    "vitals": {
+      "Weight": "13.25 kg",
+      "RR": "22/min"
+    }
   },
   "medications": [
     {
-      "name": null,
-      "type": null,
-      "dose": null,
-      "frequency": null,
-      "duration": null,
+      "name": "SYP CALPOL (250/5)",
+      "type": "Syrup",
+      "dose": "4 mL",
+      "frequency": "Every 6 Hours",
+      "duration": "3 days",
       "instructions": null
     }
   ],
   "investigations": [],
-  "advice": [],
-  "follow_up": null,
-  "summary": null,
-  "confidence_notes": null
+  "advice": ["Rest", "Adequate fluids"],
+  "follow_up": "Review after 5 days if no improvement",
+  "summary": "4-year-old female patient Ashvika presenting with URTI...",
+  "confidence_notes": "Doctor name partially legible — transliterated from Malayalam script",
+  "raw_transcription": "ഡോ. ടി. എം. ശ്രീധരൻ MBBS CHC നെമ്മാറ..."
 }
 ```
 
 ---
 
-## Output Field Reference
+## Field Reference
 
 ### `languages_detected`
-List of all languages identified in the prescription. Example: `["Hindi", "English"]`
+Array of all languages identified anywhere on the prescription.
+Example: `["Malayalam", "English"]`
 
-### `raw_transcription`
-Complete verbatim text of everything visible in the image, as-is, before translation or interpretation.
+---
 
 ### `doctor`
-| Field | Description |
-|---|---|
-| `name` | Doctor's full name (e.g. "Dr. Rajesh Kumar") |
-| `qualifications` | Degrees (e.g. "MBBS, MD (Medicine)") |
-| `designation` | Title/role (e.g. "Senior Consultant") |
-| `specialty` | Medical specialty (e.g. "General Physician", "Cardiologist") |
-| `clinic_hospital` | Name of clinic or hospital |
-| `address` | Full address including city/state |
-| `contact` | Phone, mobile, email |
-| `registration_number` | Medical council registration number |
-| `timing` | Consultation hours (e.g. "Mon–Sat 10am–2pm") |
+
+| Field | Description | Example |
+|---|---|---|
+| `name` | Full name in English | `"Dr. T. M. Sreedharan"` |
+| `qualifications` | Degrees, separated by commas | `"MBBS, M.D. Paediatrics (JIPMER)"` |
+| `designation` | Role or title | `"Registrar"`, `"Senior Consultant"` |
+| `specialty` | Medical specialty | `"Paediatrics"`, `"General Physician"` |
+| `clinic_hospital` | Clinic or hospital name | `"CHC, Nemmara"` |
+| `address` | Full address | `"123 MG Road, Thrissur, Kerala"` |
+| `contact` | Phone, mobile, email | `"8886993168"` |
+| `registration_number` | Medical council reg. no. | `"52547"` |
+| `timing` | Consultation hours | `"Mon–Sat 10:00–14:00"` |
+
+Set to `null` if not present or not clearly readable.
+
+---
 
 ### `patient`
-| Field | Description |
-|---|---|
-| `name` | Patient's full name |
-| `age` | Age as written (e.g. "32 yrs", "32") |
-| `gender` | Expanded form: "Male" or "Female" (decoded from M/F) |
-| `date` | Date of prescription |
-| `patient_id` | Hospital/clinic patient ID if present |
-| `contact` | Phone number if present |
-| `address` | Patient address if present |
+
+| Field | Description | Example |
+|---|---|---|
+| `name` | Full name (transliterated to English if needed) | `"Ashvika"` |
+| `age` | Age as written or decoded | `"4 years"`, `"32 years"` |
+| `gender` | Expanded: Male or Female | `"Female"` (decoded from `F`) |
+| `date` | Date of prescription | `"20-09-2022"` |
+| `patient_id` | Hospital/clinic patient ID | `"PT-00123"` |
+| `contact` | Phone number | `"9876543210"` |
+| `address` | Patient address | `"Palakkad, Kerala"` |
+
+---
 
 ### `clinical`
+
 | Field | Description |
 |---|---|
-| `chief_complaints` | List of symptoms/complaints (decoded from c/o shorthand) |
-| `history` | Past medical history (decoded from h/o, k/c/o) |
-| `diagnosis` | Working or confirmed diagnosis |
-| `vitals` | Key-value map: `{"BP": "120/80", "Weight": "65kg"}` |
+| `chief_complaints` | List of symptoms/complaints (decoded from `c/o` shorthand) |
+| `history` | Past medical history (decoded from `h/o`, `k/c/o`) |
+| `diagnosis` | Working or confirmed diagnoses |
+| `vitals` | Key-value map of measured values |
+
+Vitals example:
+```json
+{
+  "BP": "120/80 mmHg",
+  "Weight": "65 kg",
+  "Temperature": "99.2°F",
+  "SPO2": "98%"
+}
+```
+
+---
 
 ### `medications`
-Array of prescribed medicines. Each entry:
-| Field | Description |
-|---|---|
-| `name` | Drug name (generic or brand) |
-| `type` | Form: Tablet, Capsule, Syrup, Injection, etc. |
-| `dose` | Strength (e.g. "500mg", "10ml") |
-| `frequency` | Decoded timing (e.g. "Twice Daily", "At Bedtime") |
-| `duration` | How long to take (e.g. "5 Days", "2 Weeks") |
-| `instructions` | Special notes (e.g. "After meals", "With water") |
+
+Array of all prescribed medicines. Each object:
+
+| Field | Description | Example |
+|---|---|---|
+| `name` | Drug name — generic or brand | `"SYP CALPOL (250/5)"` |
+| `type` | Dosage form | `"Syrup"`, `"Tablet"`, `"Injection"` |
+| `dose` | Strength or volume | `"4 mL"`, `"500 mg"` |
+| `frequency` | Expanded timing | `"Twice Daily"`, `"Three Times Daily"` |
+| `duration` | Course length | `"3 days"`, `"2 weeks"` |
+| `instructions` | Special notes | `"After meals"`, `"With warm water"` |
+
+---
 
 ### `investigations`
-List of tests ordered (blood tests, X-ray, ECG, etc.).
+Array of tests ordered (blood tests, X-rays, ECG, urine culture, etc.).
+Example: `["CBC", "Chest X-ray", "Urine routine"]`
+
+---
 
 ### `advice`
-List of lifestyle or dietary advice given by the doctor.
+Array of lifestyle, dietary, or care advice given.
+Example: `["Rest for 3 days", "Avoid cold food", "Steam inhalation twice daily"]`
+
+---
 
 ### `follow_up`
-Next visit instruction (e.g. "Review after 1 week").
+Next appointment or review instruction.
+Example: `"Review after 5 days if no improvement"`
+
+---
 
 ### `summary`
-2–3 sentence summary of the full prescription in plain English.
+4–5 sentence clinical narrative in plain English covering:
+- Who the patient is (name, age, gender)
+- What condition is being treated
+- Each medication prescribed with dosage and purpose
+- Key advice and follow-up instructions
+
+---
 
 ### `confidence_notes`
-Any text that was unclear, uncertain, or ambiguous — noted here so the user knows what to verify.
+Anything that was unclear, partially legible, or ambiguous. Tells the user what to verify against the original prescription.
+Example: `"Doctor name partially legible — transliterated from Malayalam script. Medication #3 dose unclear."`
+
+---
+
+### `raw_transcription`
+Verbatim copy of visible text exactly as printed/written in the original script(s). No translation, no inference, no additions. Only characters that are physically visible in the image.
+
+---
+
+## Abbreviation Reference
+
+### Patient Patterns
+| Written | Meaning |
+|---|---|
+| `M` / `F` | Male / Female |
+| `18/M`, `18Y/M`, `18Yr/M` | 18-year-old Male |
+| `Y/O` | Years Old |
+| `Pt` | Patient |
+
+### Frequency
+| Written | Meaning |
+|---|---|
+| `OD` | Once Daily |
+| `BD` / `BID` | Twice Daily |
+| `TDS` / `TID` | Three Times Daily |
+| `QID` | Four Times Daily |
+| `HS` | At Bedtime |
+| `AC` | Before Meals |
+| `PC` | After Meals |
+| `SOS` / `PRN` | As Needed |
+| `Stat` | Immediately |
+| `ON` | Every Night |
+| `Q6H` | Every 6 Hours |
+| `Q8H` | Every 8 Hours |
+
+### Duration
+| Written | Meaning |
+|---|---|
+| `×5D` / `x 5 days` | For 5 Days |
+| `×2W` | For 2 Weeks |
+| `×1M` | For 1 Month |
+| `D` / `W` / `M` | Days / Weeks / Months |
+
+### Dosage Forms
+| Written | Meaning |
+|---|---|
+| `Tab` | Tablet |
+| `Cap` | Capsule |
+| `Syp` / `Syr` | Syrup |
+| `Inj` | Injection |
+| `Oint` / `Ung` | Ointment |
+| `Susp` | Suspension |
+| `Gt` / `Gtt` | Drops |
+| `Sachet` | Sachet |
+
+### Clinical Shorthands
+| Written | Meaning |
+|---|---|
+| `Rx` | Prescription |
+| `c/o` | Complains of |
+| `k/c/o` | Known case of |
+| `h/o` | History of |
+| `O/E` | On Examination |
+| `D/D` | Differential Diagnosis |
+| `B/P` | Blood Pressure |
+| `PR` | Pulse Rate |
+| `SPO2` | Oxygen Saturation |
+| `Wt` | Weight |
+| `Ht` | Height |
+| `T` | Temperature |
+| `URTI` | Upper Respiratory Tract Infection |
+| `RS` | Respiratory System |
+| `AEE` | Air Entry Equal |
+
+### Qualifications
+`MBBS` · `MD` · `MS` · `DNB` · `DM` · `MCh` · `DGO` · `DCH` · `FRCS` · `BDS` · `MDS` · `BAMS` · `BHMS` · `BPT` · `MPT`
 
 ---
 
 ## Saved Output Structure
 
-For every analyzed prescription, three files are saved:
-
 ```
 output/
-└── YYYY-MM-DD/
-    └── rx_HHMMSS_PatientName/
-        ├── prescription.jpg    ← original uploaded image
-        ├── prescription.json   ← structured extraction
-        └── prescription.md     ← formatted Markdown report
+├── general/                              ← General mode
+│   └── YYYY-MM-DD_HHMMSS_Doctor_Patient/
+│       ├── prescription.(jpg|png|pdf)
+│       ├── prescription.json
+│       └── prescription.md
+├── patients/                             ← Patient Wise mode
+│   └── Patient_Name/
+│       └── YYYY-MM-DD_HHMMSS/
+│           ├── prescription.(jpg|png|pdf)
+│           ├── prescription.json
+│           └── prescription.md
+└── doctors/                              ← Doctor Wise mode
+    └── Doctor_Name/
+        └── YYYY-MM-DD_HHMMSS/
+            ├── prescription.(jpg|png|pdf)
+            ├── prescription.json
+            └── prescription.md
 ```
 
-The folder name is built from the date, time, and patient name extracted from the prescription. If no patient name is found, the folder uses `unknown`.
+The folder name is automatically built from the date, time, and extracted doctor/patient names. Spaces and special characters are replaced with underscores.
 
 ---
 
-## Abbreviation Quick Reference Card
+## Customizing the Prompt
 
-### Age + Gender Patterns
-| Written | Meaning |
-|---|---|
-| `18/M` | 18-year-old Male |
-| `32 F` | 32-year-old Female |
-| `45 Yr/M` | 45-year-old Male |
-| `6 Y/O` | 6 Years Old |
+The system prompt is loaded from `prompts/default_prompt.txt` at startup — not hardcoded in Python. To change extraction behavior:
 
-### Frequency Patterns
-| Written | Meaning |
-|---|---|
-| `OD` | Once Daily |
-| `BD` or `BID` | Twice Daily |
-| `TDS` or `TID` | Three Times Daily |
-| `QID` | Four Times Daily |
-| `HS` | At Bedtime |
-| `AC` | Before Meals |
-| `PC` | After Meals |
-| `SOS` | As Needed |
-| `Stat` | Immediately |
+1. Edit `prompts/default_prompt.txt`
+2. Restart the app (`python index.py`)
 
-### Duration Patterns
-| Written | Meaning |
-|---|---|
-| `×5D` or `x 5 days` | For 5 Days |
-| `×2W` | For 2 Weeks |
-| `×1M` | For 1 Month |
-
-### Clinical Shorthands
-| Written | Meaning |
-|---|---|
-| `c/o` | Complains of |
-| `k/c/o` | Known case of |
-| `h/o` | History of |
-| `O/E` | On Examination |
-| `Rx` | Prescription |
-| `D/D` | Differential Diagnosis |
+You can safely add abbreviations, change field instructions, adjust the output format description, or add domain-specific rules without touching any Python code.

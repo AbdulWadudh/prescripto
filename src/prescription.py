@@ -4,6 +4,7 @@ import json
 import base64
 import shutil
 import datetime
+from json_repair import repair_json
 from .config import BASE_DIR, OUTPUT_DIR, IMG_EXTS, PROMPTS_DIR
 
 _MAX_IMG_DIM = 1120  # 28 * 40 — ~1600 img tokens, fits in 16k ctx
@@ -73,63 +74,21 @@ def slugify(name: str, maxlen: int = 25) -> str:
 
 # ── JSON / Markdown helpers ────────────────────────────────────────────
 
-def _fix_json(s: str) -> str:
-    """Fix common model JSON quirks before parsing."""
-    # trailing commas before } or ]
-    s = re.sub(r',\s*([}\]])', r'\1', s)
-    # single-quoted strings → double-quoted
-    s = re.sub(r"(?<![\\])'", '"', s)
-    return s
-
-
-def _find_json_object(text: str) -> str | None:
-    """Return the substring of the outermost {...} by brace counting."""
-    start = text.find('{')
-    if start == -1:
-        return None
-    depth = 0
-    in_str = False
-    escape = False
-    for i, ch in enumerate(text[start:], start):
-        if escape:
-            escape = False
-            continue
-        if ch == '\\' and in_str:
-            escape = True
-            continue
-        if ch == '"':
-            in_str = not in_str
-            continue
-        if in_str:
-            continue
-        if ch == '{':
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0:
-                return text[start:i + 1]
-    return None
-
-
 def extract_json_from_response(text: str) -> dict | None:
-    # Strip all code fence markers so ``` ```json and ``` don't interfere
-    cleaned = re.sub(r'```(?:json)?', '', text).replace('```', '').strip()
+    print(f"[json] response length: {len(text)}")
 
-    # Brace-count extraction on cleaned text, then fall back to original
-    for source in (cleaned, text):
-        raw = _find_json_object(source)
-        if not raw:
-            # Last resort: greedy regex (old behaviour)
-            m = re.search(r'\{.*\}', source, re.DOTALL)
-            raw = m.group(0) if m else None
-        if raw:
-            for attempt in (raw, _fix_json(raw)):
-                try:
-                    return json.loads(attempt)
-                except json.JSONDecodeError:
-                    pass
+    # Strip code fences
+    cleaned = re.sub(r'`+(?:json)?', '', text).strip()
 
-    print(f"[json] parse failed — snippet: {text[:300]}")
+    try:
+        result = json.loads(repair_json(cleaned))
+        if isinstance(result, dict):
+            print(f"[json] parse OK")
+            return result
+    except Exception as e:
+        print(f"[json] failed: {e}")
+
+    print(f"[json] all attempts failed")
     return None
 
 
@@ -226,8 +185,7 @@ def json_to_markdown(data: dict, image_filename: str = "", mode: str = "general"
 
     if d.get("follow_up"):
         lines.append(f"## Follow-up\n{d['follow_up']}\n")
-    if d.get("english_transcription"):
-        lines.append(f"## English Transcription\n{d['english_transcription']}\n")
+
     if d.get("raw_transcription"):
         lines.append(f"## Original Text (Verbatim)\n```\n{d['raw_transcription']}\n```\n")
     if d.get("confidence_notes"):

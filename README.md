@@ -1,106 +1,174 @@
-# Local Chatbot — Setup & Run Guide
+# Indian Medical Prescription Analyzer
 
-A fully offline, dual-model chatbot that runs entirely on your machine — no API keys, no internet connection required after setup. It uses two specialized models routed automatically per message.
+A fully offline AI-powered tool for analyzing handwritten and printed Indian medical prescriptions. No API keys, no internet connection required after setup. Two specialized models are loaded locally and routed automatically.
 
-| Input type | Model used |
+| Input | Model |
 |---|---|
-| Text, PDFs, plain files | Gemma 4 E4B Instruct (Q4_K_M) |
-| Images (with or without text) | Qwen2.5-VL 7B Instruct (Q4_K_M) + mmproj |
+| Prescription image or PDF | Qwen2.5-VL 7B Instruct (vision) |
+| Text follow-up questions | Gemma 4 E4B Instruct (text) |
 
 ---
 
-## How it works
+## Features
 
-When you send a message:
-1. The script checks if any **image** was attached.
-2. If yes → the message is routed to the **Qwen2.5-VL vision model**, which can see and reason about the image.
-3. If no → the message is routed to **Gemma**, which handles text, PDFs, and file content.
+- **Fully offline** — runs entirely on your machine after downloading the model files
+- **All Indian languages** — Hindi, Tamil, Telugu, Kannada, Malayalam, Bengali, Marathi, Gujarati, Punjabi, Odia, Urdu, and mixed-language prescriptions
+- **Structured extraction** — doctor info, patient details, medications table, diagnosis, vitals, investigations, advice, follow-up
+- **Three analysis modes** — General, Patient Wise, Doctor Wise (controls output folder organization)
+- **Conversation context** — ask follow-up questions after analysis; the full prescription context is retained
+- **Prescription history** — sidebar with all past analyses; click any card to reload and continue the conversation
+- **Edit & delete records** — update patient/doctor names or summary directly from the UI
+- **Saved output** — every analysis saves the original image, structured JSON, and a formatted Markdown report to disk
+- **SQLite database** — all records stored locally in `prescriptions.db`
 
-Both models are loaded into memory once at startup and stay loaded for the entire session, so responses are fast after the first one.
+---
 
-PDFs are not sent as files — **PyMuPDF extracts the text** from them and prepends it to your message. This means the model reads the content directly rather than processing a binary file.
+## Project Structure
+
+```
+ai-gateway/
+├── index.py                  ← entry point — run this
+├── prescriptions.db          ← SQLite database (auto-created)
+├── src/
+│   ├── config.py             ← all paths and tunable constants
+│   ├── db.py                 ← database schema and CRUD
+│   ├── llm.py                ← model loading (Gemma + Qwen2.5-VL)
+│   ├── prescription.py       ← image processing, JSON extraction, Markdown rendering
+│   └── ui.py                 ← Gradio interface and chat callback
+├── models/                   ← place GGUF model files here
+│   ├── google_gemma-4-E4B-it-Q4_K_M.gguf
+│   ├── Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf
+│   └── mmproj-Qwen_Qwen2.5-VL-7B-Instruct-f16.gguf
+├── output/                   ← saved prescription analyses (auto-created)
+│   ├── general/
+│   ├── patients/
+│   └── doctors/
+└── prompts/
+    ├── default_prompt.txt    ← vision model system prompt (edit freely)
+    └── prescription_analysis.md  ← field reference and documentation
+```
 
 ---
 
 ## Requirements
 
 - Python 3.10 or later
-- ~10 GB of free RAM or VRAM (see [Memory](#memory))
+- ~11 GB free VRAM (GPU) or RAM (CPU fallback)
 - Windows, macOS, or Linux
+- [uv](https://docs.astral.sh/uv/) — fast Python package and environment manager
 
 ---
 
-## Step 1 — Install Python dependencies
+## Step 1 — Install uv
 
 ```bash
-pip install llama-cpp-python gradio pymupdf pillow
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-**What each package does:**
+Verify the install:
+
+```bash
+uv --version
+```
+
+---
+
+## Step 2 — Create a virtual environment
+
+Inside the project folder:
+
+```bash
+cd prescripto
+uv venv
+```
+
+This creates a `.venv` folder. Activate it:
+
+```bash
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
+
+# Windows (CMD)
+.venv\Scripts\activate.bat
+
+# macOS / Linux
+source .venv/bin/activate
+```
+
+---
+
+## Step 3 — Install dependencies
+
+Install all packages except `llama-cpp-python`:
+
+```bash
+uv pip install -r requirements.txt
+```
+
+### llama-cpp-python — CPU (any platform)
+
+```bash
+uv pip install llama-cpp-python
+```
+
+### llama-cpp-python — GPU / CUDA (NVIDIA, significantly faster)
+
+Requires the [NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) to be installed first.
+
+```bash
+# Windows PowerShell
+$env:CMAKE_ARGS = "-DGGML_CUDA=on"
+uv pip install llama-cpp-python --no-cache-dir
+
+# macOS / Linux
+CMAKE_ARGS="-DGGML_CUDA=on" uv pip install llama-cpp-python --no-cache-dir
+```
 
 | Package | Purpose |
 |---|---|
-| `llama-cpp-python` | Loads and runs `.gguf` model files directly in Python — no separate server needed |
-| `gradio` | Provides the web UI (chat interface in your browser) |
-| `pymupdf` | Extracts text from PDF files so the model can read them |
-| `pillow` | Image utilities used internally by Gradio |
-
-### GPU acceleration (Windows + NVIDIA only)
-
-By default, `llama-cpp-python` runs on CPU. To enable CUDA (significantly faster):
-
-```powershell
-$env:CMAKE_ARGS = "-DGGML_CUDA=on"
-pip install llama-cpp-python --upgrade --force-reinstall --no-cache-dir
-```
-
-This recompiles the package with CUDA support. You only need to do this once. Requires the NVIDIA CUDA Toolkit to be installed.
+| `llama-cpp-python` | Loads and runs `.gguf` model files locally |
+| `gradio` | Web UI in the browser |
+| `pymupdf` | Renders the first page of PDF prescriptions as an image |
+| `pillow` | Image resizing and format conversion |
+| `json-repair` | Repairs malformed JSON output from the vision model |
 
 ---
 
-## Step 2 — Download the model files
+## Step 4 — Download model files
 
-Place all four files inside a `models/` folder next to `index.py`:
+Place all three files inside the `models/` folder:
 
-```
-ai-gateway/
-├── index.py
-└── models/
-    ├── gemma-4-E4B-it-Q4_K_M.gguf
-    ├── Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf
-    └── mmproj-Qwen_Qwen2.5-VL-7B-Instruct-f16.gguf
-```
+### Text model — Gemma 4 E4B Instruct Q4_K_M
+- **File:** `google_gemma-4-E4B-it-Q4_K_M.gguf`
+- **Size:** ~4.7 GB
+- **Download:** https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-Q4_K_M.gguf?download=true
+- **Purpose:** Handles text follow-up questions after prescription analysis
 
-The script resolves the `models/` path relative to its own location, so it works on any machine regardless of where the project is cloned.
+### Vision model — Qwen2.5-VL 7B Instruct Q4_K_M
+- **File:** `Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf`
+- **Size:** ~4.4 GB
+- **Download:** https://huggingface.co/bartowski/Qwen_Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf?download=true
+- **Purpose:** Reads and extracts information from prescription images
 
-### Text model
-**Gemma 4 E4B Instruct Q4_K_M**
-- File: `gemma-4-E4B-it-Q4_K_M.gguf`
-- Size: ~4.7 GB
-- Source: HuggingFace — search `bartowski/gemma-4-E4B-it-GGUF`
-
-### Vision model (two files required)
-**Qwen2.5-VL 7B Instruct Q4_K_M**
-- File: `Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf`
-- Size: ~4.4 GB
-- Source: HuggingFace — search `bartowski/Qwen2.5-VL-7B-Instruct-GGUF`
-
-**Vision projector (mmproj)**
-- File: `mmproj-Qwen_Qwen2.5-VL-7B-Instruct-f16.gguf`
-- Size: ~1.3 GB
-- Source: same repo as above
-
-> The mmproj file is a separate encoder that maps image pixels into the token space the language model understands. It must match the vision model exactly — you cannot mix mmproj files from different models.
+### Vision projector (required for vision model)
+- **File:** `mmproj-Qwen_Qwen2.5-VL-7B-Instruct-f16.gguf`
+- **Size:** ~1.3 GB
+- **Download:** https://huggingface.co/bartowski/Qwen_Qwen2.5-VL-7B-Instruct-GGUF/blob/main/mmproj-Qwen_Qwen2.5-VL-7B-Instruct-f16.gguf
+- **Purpose:** Encodes image pixels into tokens the language model understands. Must match the vision model exactly.
 
 ---
 
-## Step 3 — Run the chatbot
+## Step 5 — Run
 
 ```bash
 python index.py
 ```
 
-The script will print startup progress in the terminal:
+Startup output:
 
 ```
 [load] text model:   gemma-4-E4B-it-Q4_K_M.gguf
@@ -109,88 +177,126 @@ The script will print startup progress in the terminal:
 * Running on local URL:  http://127.0.0.1:7860
 ```
 
-Open **http://127.0.0.1:7860** in your browser. The UI will show a chat box where you can type messages and attach files.
-
-Loading both models takes 30–90 seconds depending on your hardware. Subsequent messages within the same session respond immediately.
+Open **http://127.0.0.1:7860** in your browser. Loading both models takes 30–90 seconds on first run.
 
 ---
 
-## Step 4 — Using the chatbot
+## Step 6 — Using the analyzer
 
-### Plain text
-Type any question and press Enter. Gemma handles it.
+### Analyze a prescription
+Upload a `.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`, or `.pdf` file using the attachment button. No text message is required — the model will analyze the prescription automatically. For PDFs, the first page is rendered and analyzed.
 
-### Attach a PDF
-Click the paperclip icon, select a `.pdf`. The text is extracted and sent to Gemma with your question. Example:
+### Ask follow-up questions
+After a prescription is analyzed, type any question in the chat. The full prescription context is retained, so questions like *"What is this medication used for?"* or *"Explain the dosage for the first medicine"* will be answered in context by Gemma.
 
-> *"Summarise the key points from this document"* + attach `report.pdf`
+### View prescription history
+Past analyses are stored in the database. Click any record in the sidebar to load the full prescription report and continue asking questions from there.
 
-### Attach an image
-Attach any `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, or `.bmp`. The message is automatically routed to Qwen2.5-VL. Example:
+### Edit a record
+Click the pencil (✎) button on any history card to edit the patient name, doctor name, or summary inline.
 
-> *"What does this chart show?"* + attach `graph.png`
+### Delete a record
+Click the ✕ button on any history card. A confirmation prompt will appear before deletion.
 
-### Attach both an image and a PDF
-Both are processed — the PDF text is prepended as context and the image goes to the vision model together.
+---
 
-### Attach a text/code file
-`.txt` and `.md` files are read as plain text and included in the Gemma context, same as PDFs.
+## Output
+
+Every analyzed prescription is saved to the `output/` folder. The subfolder structure depends on the analysis mode:
+
+```
+output/
+├── general/
+│   └── 2026-04-20_143022_Dr_Sharma_Ravi_Kumar/
+│       ├── prescription.jpg      ← original uploaded image
+│       ├── prescription.json     ← full structured extraction
+│       └── prescription.md       ← formatted Markdown report
+├── patients/
+│   └── Ravi_Kumar/
+│       └── 2026-04-20_143022/
+│           ├── prescription.jpg
+│           ├── prescription.json
+│           └── prescription.md
+└── doctors/
+    └── Dr_Sharma/
+        └── 2026-04-20_143022/
+            ├── prescription.jpg
+            ├── prescription.json
+            └── prescription.md
+```
+
+### Extracted fields
+
+| Section | Fields |
+|---|---|
+| Doctor | Name, qualifications, designation, specialty, clinic/hospital, address, contact, registration number, timing |
+| Patient | Name, age, gender, date, patient ID, contact, address |
+| Clinical | Chief complaints, history, diagnosis, vitals |
+| Medications | Name, type, dose, frequency, duration, instructions (table format) |
+| Other | Investigations, advice, follow-up, summary, confidence notes, raw transcription |
+
+All fields except `raw_transcription` are output in English. The `raw_transcription` field contains verbatim text in the original script as it appears on the prescription.
 
 ---
 
 ## Configuration
 
-All tuneable settings are at the top of [index.py](index.py):
+All settings are in `src/config.py`:
 
 ```python
-MODELS_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-N_GPU_LAYERS  = -1      # -1 = all layers on GPU, 0 = CPU only
-N_CTX_TEXT    = 8192    # context window for Gemma (tokens)
-N_CTX_VISION  = 4096    # context window for Qwen-VL (smaller — images use many tokens)
-MAX_TOKENS    = 1024    # maximum tokens per response
-TEMPERATURE   = 0.7     # 0 = deterministic, 1 = more creative
+N_GPU_LAYERS = -1       # -1 = all layers on GPU, 0 = CPU only
+N_CTX_TEXT   = 8192     # context window for Gemma (tokens)
+N_CTX_VISION = 16384    # context window for Qwen2.5-VL (tokens)
+MAX_TOKENS   = 4096     # maximum output tokens per response
+TEMPERATURE  = 0.1      # 0 = deterministic, 1 = creative
 ```
 
-**When to change these:**
+| Setting | When to change |
+|---|---|
+| `N_GPU_LAYERS = 0` | No GPU or insufficient VRAM — falls back to CPU/RAM (slower) |
+| `N_CTX_TEXT` | Increase for longer follow-up conversations |
+| `N_CTX_VISION` | Increase for very dense prescriptions; uses more VRAM |
+| `MAX_TOKENS` | Increase if prescription analysis is getting cut off |
+| `TEMPERATURE` | Keep low (0.1) for accurate extraction; raise for creative text tasks |
 
-- `N_GPU_LAYERS = 0` — if you have no GPU or run out of VRAM; runs on CPU/RAM instead (slower)
-- `N_CTX_TEXT` — increase if you need to process very long PDFs; uses more VRAM
-- `MAX_TOKENS` — increase for longer responses, decrease to speed things up
-- `TEMPERATURE` — lower for factual/structured tasks, higher for creative writing
+### Customizing the system prompt
+
+The vision model's instructions are loaded from `prompts/default_prompt.txt` at startup. Edit this file to change extraction behavior, add abbreviations, or adjust output format. No Python changes required — just restart the app.
 
 ---
 
-## Memory
+## Memory usage
 
-Both models are loaded simultaneously:
-
-| Component | Approx. size |
+| Component | Approx. VRAM/RAM |
 |---|---|
-| Gemma 4 E4B (text) | ~4.7 GB |
-| Qwen2.5-VL 7B (vision) | ~4.4 GB |
-| Qwen mmproj (vision encoder) | ~1.3 GB |
-| **Total** | **~10.4 GB** |
+| Gemma 4 E4B Q4_K_M | ~4.7 GB |
+| Qwen2.5-VL 7B Q4_K_M | ~4.4 GB |
+| mmproj encoder | ~1.3 GB |
+| KV cache (16k vision ctx) | ~1.0 GB |
+| **Total** | **~11.4 GB** |
 
-If you don't have enough VRAM/RAM:
-- Set `N_GPU_LAYERS = 0` to offload everything to system RAM (slower but uses less VRAM)
-- Or comment out the vision model block if you only need text/PDF support
+If you run out of VRAM, set `N_GPU_LAYERS = 0` to offload to system RAM, or reduce `N_CTX_VISION` to `8192`.
 
 ---
 
 ## Troubleshooting
 
 ### `[warn] vision disabled` at startup
-The vision model or mmproj failed to load. Check the console message for details. Common causes:
-- Wrong mmproj file (must match the vision model)
-- Insufficient VRAM to load both models with GPU layers
+The vision model or mmproj failed to load. Text follow-ups still work; only prescription image analysis is disabled. Common causes:
+- Wrong or missing mmproj file (must be from the same model repo)
+- Insufficient VRAM — try reducing `N_CTX_VISION` or set `N_GPU_LAYERS = 0`
 
-The chatbot will still run with text and PDF support — only image inputs will be disabled.
+### `[error] vision inference failed: access violation`
+Image dimensions were not aligned to the model's patch size. The app handles this automatically — images are resized to multiples of 28 pixels. If this still occurs, check that `src/prescription.py` has `_PATCH = 28` set.
 
-### Out of memory / crash during load
-Set `N_GPU_LAYERS = 0` in the script to keep models on RAM instead of VRAM, or reduce `N_CTX_TEXT` / `N_CTX_VISION`.
+### `Could not parse structured data from the model response`
+The model returned output that could not be parsed as JSON. Check the console for `[json]` diagnostic lines showing exactly what was received. Usually caused by the response being truncated — try increasing `MAX_TOKENS` in `src/config.py`.
 
-### Slow first response
-Normal — the model is warming up. Subsequent responses in the same session are faster.
+### History sidebar is empty
+Records are only saved after a successful prescription analysis (image or PDF upload). Text-only conversations are not saved to the database.
 
 ### Port already in use
-If `7860` is taken, Gradio will automatically try the next available port and print the URL in the terminal.
+Gradio will automatically try the next available port and print the URL in the terminal.
+
+### Slow first response
+Normal — the model is warming up its KV cache. Subsequent responses in the same session are faster.
