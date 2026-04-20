@@ -14,13 +14,7 @@ A fully offline AI-powered tool for analyzing handwritten and printed Indian med
 - **Fully offline** — runs entirely on your machine after downloading the model files
 - **All Indian languages** — Hindi, Tamil, Telugu, Kannada, Malayalam, Bengali, Marathi, Gujarati, Punjabi, Odia, Urdu, and mixed-language prescriptions
 - **Structured extraction** — doctor info, patient details, medications table, diagnosis, vitals, investigations, advice, follow-up
-- **Three analysis modes** — General, Patient Wise, Doctor Wise (controls output folder organization)
-- **Conversation context** — ask follow-up questions after analysis; the full prescription context is retained
-- **Prescription history** — sidebar with all past analyses; click any card to reload and continue the conversation
-- **Edit & delete records** — update patient/doctor names or summary directly from the UI
 - **Saved output** — every analysis saves the original image, structured JSON, and a formatted Markdown report to disk
-- **SQLite database** — all records stored locally in `prescriptions.db`
-
 ---
 
 ## Project Structure
