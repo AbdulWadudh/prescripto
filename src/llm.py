@@ -24,7 +24,6 @@ try:
         chat_handler=vision_handler,
         n_gpu_layers=N_GPU_LAYERS,
         n_ctx=N_CTX_VISION,
-        logits_all=True,
         verbose=False,
     )
     # Probe mtmd lazy init — needs a >=2x2 image

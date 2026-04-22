@@ -12,8 +12,8 @@ VISION_MODEL_PATH  = os.path.join(MODELS_DIR, "Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_
 VISION_MMPROJ_PATH = os.path.join(MODELS_DIR, "mmproj-Qwen_Qwen2.5-VL-7B-Instruct-f16.gguf")
 
 N_GPU_LAYERS = -1
-N_CTX_TEXT   = 8192
-N_CTX_VISION = 16384   # ~1600 img tokens (1120px) + 2k prompt + 4k output
+N_CTX_TEXT   = 32768    # Gemma native max
+N_CTX_VISION = 32768    # fits ~8K prompt + 4-6 images + 4K output in VRAM
 MAX_TOKENS   = 4096
 TEMPERATURE  = 0.1
 

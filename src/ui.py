@@ -1,17 +1,27 @@
 import os
 import json
+import queue
 import random
+import re
 import sqlite3
+import sys
+import threading
+import time
 import gradio as gr
 
-from .config import DB_PATH, MODE_MAP, MAX_TOKENS, TEMPERATURE
+from .config import DB_PATH, MODE_MAP, MAX_TOKENS, TEMPERATURE, N_CTX_VISION
 from .db import save_to_db
 from .llm import text_llm, vision_llm
 from .prescription import (
+    DEFAULT_PROMPT_FILE,
     PRESCRIPTION_SYSTEM_PROMPT,
-    get_prescription_file,
+    get_formatter_for,
+    get_prescription_files,
     extract_json_from_response,
     json_to_markdown,
+    list_prompt_files,
+    load_prompt,
+    pack_into_batches,
     save_prescription_output,
 )
 
@@ -78,8 +88,128 @@ def normalize_history(history):
     return out
 
 
-def respond(message, history, mode_label: str):
+_VISION_LOG_KEEP = 8  # lines of llama.cpp vision log to display in UI
+
+_RE_ENCODE_DONE = re.compile(r"image slice encoded in (\d+) ms")
+_RE_BATCH_DONE  = re.compile(r"image decoded \(batch (\d+)/(\d+)\) in (\d+) ms")
+_RE_LOG_ALLOW   = re.compile(
+    r"(encoding image|image slice encoded|decoding image batch|image decoded)"
+)
+
+
+def _summarize_vision_logs(lines: list[str]) -> dict:
+    encoded = 0
+    encode_ms = 0
+    batches = 0
+    batch_ms = 0
+    for line in lines:
+        m = _RE_ENCODE_DONE.search(line)
+        if m:
+            encoded += 1
+            encode_ms += int(m.group(1))
+            continue
+        m = _RE_BATCH_DONE.search(line)
+        if m:
+            batches += 1
+            batch_ms += int(m.group(3))
+    return {
+        "encoded":    encoded,
+        "encode_s":   encode_ms / 1000.0,
+        "batches":    batches,
+        "batch_s":    batch_ms / 1000.0,
+    }
+
+
+def _vision_infer_with_logs(vision_llm, **kwargs):
+    """Run vision_llm.create_chat_completion while streaming stderr back.
+
+    Yields ('log', line), ('tick', None), then either ('result', completion)
+    or ('error', exception). Captures fd 2 (stderr) via an OS-level pipe so
+    llama.cpp's C++ image-encoding logs are visible to the caller in real time.
+    """
+    log_q: "queue.Queue[tuple[str, object]]" = queue.Queue()
+    result_holder: dict = {}
+
+    # Set up fd 2 → pipe redirect
+    r, w = os.pipe()
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+    orig_fd = os.dup(2)
+    os.dup2(w, 2)
+    os.close(w)  # fd 2 keeps the write end alive; closing orig_fd later drops it
+
+    def reader():
+        buf = b""
+        try:
+            while True:
+                chunk = os.read(r, 4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    text = line.decode("utf-8", errors="replace").rstrip()
+                    if text:
+                        log_q.put(("log", text))
+            if buf.strip():
+                log_q.put(("log", buf.decode("utf-8", errors="replace").rstrip()))
+        except OSError:
+            pass
+
+    def worker():
+        try:
+            result_holder["result"] = vision_llm.create_chat_completion(**kwargs)
+        except Exception as exc:
+            result_holder["error"] = exc
+
+    reader_t = threading.Thread(target=reader, daemon=True)
+    worker_t = threading.Thread(target=worker, daemon=True)
+    reader_t.start()
+    worker_t.start()
+
+    try:
+        # Drain logs while worker is running; tick if the queue is quiet so
+        # the generator can update elapsed-time readouts.
+        while worker_t.is_alive():
+            try:
+                kind, val = log_q.get(timeout=0.3)
+                yield kind, val
+            except queue.Empty:
+                yield "tick", None
+    finally:
+        worker_t.join()
+        # Restore stderr so the reader sees EOF and exits.
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os.dup2(orig_fd, 2)
+        os.close(orig_fd)
+        reader_t.join(timeout=2.0)
+        try:
+            os.close(r)
+        except OSError:
+            pass
+        # Drain anything buffered after the worker finished.
+        while not log_q.empty():
+            try:
+                kind, val = log_q.get_nowait()
+                if kind == "log":
+                    yield "log", val
+            except queue.Empty:
+                break
+
+    if "error" in result_holder:
+        yield "error", result_holder["error"]
+    else:
+        yield "result", result_holder["result"]
+
+
+def respond(message, history, mode_label: str, prompt_file: str = DEFAULT_PROMPT_FILE):
     mode = MODE_MAP.get(mode_label, "general")
+    system_prompt = load_prompt(prompt_file) if prompt_file else PRESCRIPTION_SYSTEM_PROMPT
 
     if isinstance(message, dict):
         user_text = message.get("text", "") or ""
@@ -87,53 +217,282 @@ def respond(message, history, mode_label: str):
     else:
         user_text, files = str(message), []
 
-    file_path, data_uri = get_prescription_file(files)
+    t_start = time.monotonic()
+    prescription_files = get_prescription_files(files)
+    t_prep = time.monotonic() - t_start
 
     # ── prescription analysis ──────────────────────────────────────────
-    if file_path:
+    if prescription_files:
         if vision_llm is None:
             yield "**Vision is disabled** — check the console for details."
             return
 
-        yield "*Generating...*"
-        print(f"[route: prescription/{mode}] {os.path.basename(file_path)}")
+        is_default_prompt = (prompt_file or DEFAULT_PROMPT_FILE) == DEFAULT_PROMPT_FILE
+        # dedupe source paths (a multi-page PDF shows up once per page)
+        seen: set[str] = set()
+        file_paths: list[str] = []
+        for fp, _ in prescription_files:
+            if fp not in seen:
+                seen.add(fp)
+                file_paths.append(fp)
+        fnames      = [os.path.basename(fp) for fp in file_paths]
+        total_pages = len(prescription_files)
+        total_src   = len(file_paths)
 
-        user_content = [
-            {"type": "image_url", "image_url": {"url": data_uri}},
-            {"type": "text",      "text": user_text.strip() or "Analyze."},
+        # ── batch planning ─────────────────────────────────────────────
+        # Each 1120px image ≈ 1600 vision tokens. We pack images into batches
+        # whose combined tokens + system prompt + output buffer fit in ctx.
+        VISION_TOKENS_PER_IMAGE = 1600
+        sys_tok_est = max(1, len(system_prompt) // 4)
+        per_batch_budget = max(
+            VISION_TOKENS_PER_IMAGE,
+            N_CTX_VISION - sys_tok_est - MAX_TOKENS - 1024,
+        )
+        batches = pack_into_batches(prescription_files, VISION_TOKENS_PER_IMAGE, per_batch_budget)
+        num_batches = len(batches)
+
+        steps: list[str] = [
+            f"✅ **Prepared** {total_src} file{'s' if total_src > 1 else ''}, "
+            f"{total_pages} page{'s' if total_pages > 1 else ''} — `{t_prep:.1f}s`"
         ]
+        if num_batches > 1:
+            max_per_batch = max(len(b) for b in batches)
+            steps.append(
+                f"📦 **Split into {num_batches} batches** "
+                f"(≤ {max_per_batch} images/batch to fit {N_CTX_VISION:,}-token context)"
+            )
 
-        try:
-            result = vision_llm.create_chat_completion(
+        def progress(extra: str = "") -> str:
+            body = "### Processing\n" + "\n".join(f"- {s}" for s in steps)
+            return body + (f"\n\n---\n\n{extra}" if extra else "")
+
+        yield progress()
+        print(f"[route: prescription/{mode}] {total_src} file(s) / {total_pages} page(s), "
+              f"{num_batches} batch(es): {fnames} [prompt: {prompt_file}]")
+
+        default_instruction = (
+            "Analyze these prescriptions together as one case." if total_src > 1 else "Analyze."
+        )
+
+        # ── run vision inference per batch ─────────────────────────────
+        batch_outputs: list[tuple[list[str], str]] = []   # [(paths_in_batch, raw_output), ...]
+        t_vision_total = 0.0
+
+        for bi, batch in enumerate(batches, 1):
+            batch_seen: set[str] = set()
+            batch_paths: list[str] = []
+            for fp, _ in batch:
+                if fp not in batch_seen:
+                    batch_seen.add(fp)
+                    batch_paths.append(fp)
+            batch_pages = len(batch)
+            batch_label_prefix = (
+                f"Batch {bi}/{num_batches} · " if num_batches > 1 else ""
+            )
+
+            steps.append(
+                f"⏳ **{batch_label_prefix}Vision analyzing** "
+                f"{batch_pages} image{'s' if batch_pages > 1 else ''}..."
+            )
+            yield progress()
+
+            user_content = [
+                {"type": "image_url", "image_url": {"url": uri}} for _, uri in batch
+            ]
+            user_content.append({
+                "type": "text",
+                "text": user_text.strip() or default_instruction,
+            })
+
+            t_b_start = time.monotonic()
+            vision_logs: list[str] = []
+            vision_result = None
+            vision_error  = None
+
+            def _batch_step(elapsed: float) -> str:
+                tail = "\n".join(vision_logs[-_VISION_LOG_KEEP:])
+                summary = _summarize_vision_logs(vision_logs)
+                sub = []
+                if summary["encoded"]:
+                    sub.append(
+                        f"encoded {summary['encoded']} slice"
+                        f"{'s' if summary['encoded'] > 1 else ''} "
+                        f"(`{summary['encode_s']:.1f}s`)"
+                    )
+                if summary["batches"]:
+                    sub.append(
+                        f"decoded {summary['batches']} batch"
+                        f"{'es' if summary['batches'] > 1 else ''} "
+                        f"(`{summary['batch_s']:.1f}s`)"
+                    )
+                line = (
+                    f"⏳ **{batch_label_prefix}Vision analyzing** "
+                    f"{batch_pages} image{'s' if batch_pages > 1 else ''} — `{elapsed:.1f}s`"
+                    + (f" · {' · '.join(sub)}" if sub else "")
+                )
+                if tail:
+                    line += f"\n\n```\n{tail}\n```"
+                return line
+
+            for kind, val in _vision_infer_with_logs(
+                vision_llm,
                 messages=[
-                    {"role": "system", "content": PRESCRIPTION_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user",   "content": user_content},
                 ],
                 stream=False,
                 temperature=TEMPERATURE,
                 max_tokens=MAX_TOKENS,
                 seed=random.randint(1, 2**31 - 1),
+            ):
+                if kind == "log":
+                    # Filter stderr noise — keep only image encode/decode lines.
+                    if not _RE_LOG_ALLOW.search(val):
+                        continue
+                    vision_logs.append(val)
+                    steps[-1] = _batch_step(time.monotonic() - t_b_start)
+                    yield progress()
+                elif kind == "tick":
+                    steps[-1] = _batch_step(time.monotonic() - t_b_start)
+                    yield progress()
+                elif kind == "error":
+                    vision_error = val
+                elif kind == "result":
+                    vision_result = val
+
+            t_batch = time.monotonic() - t_b_start
+            t_vision_total += t_batch
+
+            if vision_error is not None:
+                print(f"[batch {bi}/{num_batches}] failed: {vision_error}")
+                steps[-1] = (
+                    f"❌ **{batch_label_prefix}Vision failed** — `{t_batch:.1f}s`: "
+                    f"{vision_error}"
+                )
+                yield progress()
+                continue
+
+            raw = vision_result["choices"][0]["message"]["content"]
+            print(f"[batch {bi}/{num_batches}] response: {len(raw)} chars in {t_batch:.1f}s")
+            summary = _summarize_vision_logs(vision_logs)
+            extra_bits = []
+            if summary["encoded"]:
+                extra_bits.append(f"encoded {summary['encoded']} `{summary['encode_s']:.1f}s`")
+            if summary["batches"]:
+                extra_bits.append(f"decoded {summary['batches']} `{summary['batch_s']:.1f}s`")
+            steps[-1] = (
+                f"✅ **{batch_label_prefix}Vision complete** — `{t_batch:.1f}s` "
+                f"({batch_pages} image{'s' if batch_pages > 1 else ''}, "
+                f"{len(raw):,} chars"
+                + (f" · {' · '.join(extra_bits)}" if extra_bits else "")
+                + ")"
             )
-            raw = result["choices"][0]["message"]["content"]
-        except Exception as exc:
-            print(f"[error] vision inference failed: {exc}")
-            yield f"**Analysis failed:** {exc}"
+            yield progress()
+            batch_outputs.append((batch_paths, raw))
+
+        if not batch_outputs:
+            yield "**All batches failed.** See console for details."
             return
 
-        print(f"[prescription] response: {len(raw)} chars")
+        def timing_footer(**extra) -> str:
+            t_total = time.monotonic() - t_start
+            parts = [f"Total: `{t_total:.1f}s`", f"Prep: `{t_prep:.1f}s`",
+                     f"Vision: `{t_vision_total:.1f}s`"]
+            if num_batches > 1:
+                parts.append(f"Batches: `{num_batches}`")
+            for k, v in extra.items():
+                parts.append(f"{k}: `{v:.1f}s`")
+            return "\n\n---\n*" + " · ".join(parts) + "*"
 
-        json_data = extract_json_from_response(raw)
-        if json_data:
-            fname   = os.path.basename(file_path)
-            md_text = json_to_markdown(json_data, fname, mode)
-            out_dir = save_prescription_output(file_path, json_data, md_text, mode)
-            save_to_db(mode, fname, out_dir, json_data)
-            yield md_text
-        else:
-            yield (
-                "Could not parse structured data from the model response.\n\n"
-                f"**Raw output:**\n```\n{raw[:3000]}\n```"
+        def _batch_heading(bi: int) -> str:
+            return f"## Batch {bi}/{num_batches}\n\n" if num_batches > 1 else ""
+
+        # ── Non-default prompt → raw output or formatter-rendered ─────
+        if not is_default_prompt:
+            formatter_file = get_formatter_for(prompt_file)
+            if formatter_file:
+                print(f"[formatter] applying {formatter_file} to {len(batch_outputs)} batch(es)")
+                formatter_prompt = load_prompt(formatter_file)
+                md_sections: list[str] = []
+                t_fmt_start = time.monotonic()
+
+                for bi, (_, raw) in enumerate(batch_outputs, 1):
+                    parsed = extract_json_from_response(raw)
+                    if not parsed:
+                        md_sections.append(
+                            _batch_heading(bi) + f"```\n{raw[:3000]}\n```"
+                        )
+                        continue
+                    steps.append(
+                        f"⏳ **Formatting batch {bi}/{len(batch_outputs)}** "
+                        f"with `{formatter_file}`..."
+                    )
+                    yield progress()
+                    json_payload = json.dumps(parsed, indent=2, ensure_ascii=False)
+                    t_sec_start = time.monotonic()
+                    try:
+                        stream = text_llm.create_chat_completion(
+                            messages=[
+                                {"role": "system", "content": formatter_prompt},
+                                {"role": "user",   "content": json_payload},
+                            ],
+                            stream=True,
+                            temperature=0.2,
+                            max_tokens=MAX_TOKENS,
+                        )
+                        acc = ""
+                        for chunk in stream:
+                            delta = chunk["choices"][0]["delta"].get("content", "")
+                            if delta:
+                                acc += delta
+                                elapsed = time.monotonic() - t_sec_start
+                                steps[-1] = (
+                                    f"⏳ **Formatting batch {bi}/{len(batch_outputs)}** "
+                                    f"with `{formatter_file}` — `{elapsed:.1f}s`"
+                                )
+                                preview = "\n\n---\n\n".join(md_sections + [_batch_heading(bi) + acc])
+                                yield progress() + "\n\n---\n\n" + preview
+                        steps[-1] = (
+                            f"✅ **Formatted batch {bi}/{len(batch_outputs)}** — "
+                            f"`{time.monotonic() - t_sec_start:.1f}s`"
+                        )
+                        yield progress()
+                        md_sections.append(_batch_heading(bi) + acc)
+                    except Exception as exc:
+                        print(f"[formatter] batch {bi} failed: {exc}")
+                        steps[-1] = f"⚠️ **Formatter failed** on batch {bi}: {exc}"
+                        md_sections.append(_batch_heading(bi) + f"```\n{raw[:3000]}\n```")
+
+                t_format = time.monotonic() - t_fmt_start
+                yield "\n\n---\n\n".join(md_sections) + timing_footer(Formatter=t_format)
+                return
+
+            # No formatter → show raw outputs (concatenated if multi-batch)
+            raw_joined = "\n\n---\n\n".join(
+                _batch_heading(bi) + raw for bi, (_, raw) in enumerate(batch_outputs, 1)
             )
+            yield raw_joined + timing_footer()
+            return
+
+        # ── Default prompt → parse JSON, save, render markdown per batch ─
+        t_save_start = time.monotonic()
+        md_sections: list[str] = []
+        for bi, (paths, raw) in enumerate(batch_outputs, 1):
+            combined_fname = ", ".join(os.path.basename(p) for p in paths)
+            json_data = extract_json_from_response(raw)
+            if json_data:
+                md_text = json_to_markdown(json_data, combined_fname, mode)
+                out_dir = save_prescription_output(paths, json_data, md_text, mode)
+                save_to_db(mode, combined_fname, out_dir, json_data)
+                md_sections.append(_batch_heading(bi) + md_text)
+            else:
+                md_sections.append(
+                    _batch_heading(bi)
+                    + "Could not parse structured data from the model response.\n\n"
+                    + f"**Raw output:**\n```\n{raw[:3000]}\n```"
+                )
+        t_save = time.monotonic() - t_save_start
+        yield "\n\n---\n\n".join(md_sections) + timing_footer(Save=t_save)
         return
 
     # ── text follow-up ─────────────────────────────────────────────────
@@ -381,17 +740,25 @@ with gr.Blocks(title="Indian Medical Prescription Analyzer", fill_height=True) a
                 ),
                 visible=False,
             )
+            _prompt_options = list_prompt_files() or [("Default Prompt", DEFAULT_PROMPT_FILE)]
+            prompt_selector = gr.Dropdown(
+                choices=_prompt_options,
+                value=DEFAULT_PROMPT_FILE,
+                label="System Prompt",
+                info="Choose which prompt to send to the vision model. Add more by dropping .txt files in the prompts/ folder.",
+                interactive=True,
+            )
             _chatbot = gr.Chatbot(height=600, label="")
             gr.ChatInterface(
                 fn=respond,
                 chatbot=_chatbot,
                 multimodal=True,
                 fill_height=True,
-                additional_inputs=[mode],
+                additional_inputs=[mode, prompt_selector],
                 textbox=gr.MultimodalTextbox(
                     file_types=[".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf"],
-                    file_count="single",
-                    placeholder="Upload a prescription image or PDF — no text needed. Or type a follow-up question.",
+                    file_count="multiple",
+                    placeholder="Upload one or more prescription images or PDFs. Or type a follow-up question.",
                 ),
             )
 
